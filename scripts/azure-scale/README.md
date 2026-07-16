@@ -86,7 +86,7 @@ overhead.
 | `hpl_cpu_check` | `checks/` | All N | Peak FLOPS, full cluster |
 | `hpcg_check` | `checks/` | All N | Memory bandwidth / latency stress |
 | `hpl_gpu_check` | `checks/` | All GPU nodes | Multi-node GPU LINPACK via NCCL |
-| `juju_agent_overhead` | `checks/` | 1 per partition | jujud CPU/RAM/disk/threads |
+| `juju_agent_overhead` | `checks/` | 1 per partition | jujud/snapd CPU/RAM, aggregate Juju overhead, disk usage |
 | `slurm_dispatch_latency` | `checks/` | 1 (login → compute) | srun/sbatch/sinfo/scontrol latency |
 
 ### Concurrent split-cluster tests (single run, requires `--nodes >= 4`)
@@ -174,18 +174,26 @@ first time each application flips to `active` is recorded.
 }
 ```
 
-### 2. Juju Agent Runtime Overhead Check
+### 2. Infrastructure Overhead Check
 
 **File:** `checks/infrastructure/juju_overhead.py`
 
-Measures the resource footprint of `jujud` on each partition.
+Measures the full resource footprint of the Juju/charm infrastructure — not
+just `jujud`, but all Juju-related processes including `snapd`, `juju-run`,
+and charm hook helpers. On the baseline (raw VM) pipeline these metrics will
+be zero, making the overhead directly measurable as the delta between pipelines.
 
 | Metric | Unit | Description |
 |--------|------|-------------|
 | `jujud_cpu_percent` | % | CPU usage of jujud process |
 | `jujud_rss_mb` | MB | Resident memory of jujud |
-| `juju_disk_mb` | MB | Disk usage of `/var/lib/juju` |
 | `jujud_threads` | count | Thread count of jujud |
+| `snapd_cpu_percent` | % | CPU usage of snapd (charm runtime) |
+| `snapd_rss_mb` | MB | Resident memory of snapd |
+| `total_juju_cpu_percent` | % | Aggregate CPU of all Juju-related processes |
+| `total_juju_rss_mb` | MB | Aggregate RSS of all Juju-related processes |
+| `juju_disk_mb` | MB | Disk usage of `/var/lib/juju` (state) |
+| `juju_log_disk_mb` | MB | Disk usage of `/var/log/juju` (logs) |
 
 ### 3. Slurm Scheduling Latency Check
 
