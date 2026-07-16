@@ -1,0 +1,11 @@
+## HPCG.dat template — values substituted at runtime by ReFrame
+## Tokens like {{NTASKS}}, {{NX}}, {{NY}}, {{NZ}}, {{RT}} are replaced by the check.
+##
+## This file is kept for reference — the actual HPCG.dat is generated
+## programmatically in hpcg.py's prepare_hpcg_dat() method.
+
+{{NTASKS}}
+{{NX}}
+{{NY}}
+{{NZ}}
+{{RT}}

@@ -1,0 +1,61 @@
+# Copyright 2025 Canonical Ltd.
+# See LICENSE file for licensing details.
+
+#
+# HPL Makefile for Linux with OpenBLAS.
+# This file is referenced by the build_hpl_cpu ReFrame check.
+# Adjust MPdir and LAlib if your system uses a different MPI/BLAS.
+#
+SHELL        = /bin/sh
+CD           = cd
+CP           = cp
+LN_S         = ln -fs
+MKDIR        = mkdir
+RM           = /bin/rm -f
+TOUCH        = touch
+
+# --------------------------------------------------------------------
+# - HPL Directory Structure / HPL library ------------------------------
+# --------------------------------------------------------------------
+TOPdir       = $(HOME)/hpl
+INCdir       = $(TOPdir)/include
+BINdir       = $(TOPdir)/bin/$(ARCH)
+LIBdir       = $(TOPdir)/lib/$(ARCH)
+HPLlib       = $(LIBdir)/libhpl.a
+
+# --------------------------------------------------------------------
+# - Message Passing library (MPI) --------------------------------------
+# --------------------------------------------------------------------
+MPdir        = /usr/lib/x86_64-linux-gnu/openmpi
+MPinc        = -I$(MPdir)/include
+MPlib        = $(MPdir)/lib/libmpi.so
+
+# --------------------------------------------------------------------
+# - Linear Algebra library (BLAS or VSIPL) -----------------------------
+# --------------------------------------------------------------------
+LAdir        = /usr/lib/x86_64-linux-gnu
+LAinc        =
+LAlib        = $(LAdir)/libopenblas.so
+
+# --------------------------------------------------------------------
+# - F77 / C interface --------------------------------------------------
+# --------------------------------------------------------------------
+F2CDEFS      = -DAdd__ -DF77_INTEGER=int -DStringSunStyle
+
+# --------------------------------------------------------------------
+# - HPL includes / libraries / specifics ------------------------------
+# --------------------------------------------------------------------
+HPL_INCLUDES = -I$(INCdir) -I$(INCdir)/$(ARCH) $(LAinc) $(MPinc)
+HPL_LIBS     = $(HPLlib) $(LAlib) $(MPlib)
+HPL_OPTS     = $(HPL_INCLUDES) $(F2CDEFS)
+
+# --------------------------------------------------------------------
+# - Compilers / linkage flags -----------------------------------------
+# --------------------------------------------------------------------
+CC           = mpicc
+CCNOOPT      = $(HPL_DEFS)
+CCFLAGS      = $(HPL_DEFS) -fomit-frame-pointer -O3 -funroll-loops
+LINKER       = mpicc
+LINKFLAGS    = $(CCFLAGS)
+
+ARCH         = Linux_PII_FBLAS
