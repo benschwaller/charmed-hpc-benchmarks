@@ -28,18 +28,6 @@ variable "hb120rs_v3_units" {
   description = "Number of HB120rs_v3 compute nodes (CPU/RDMA partition). Scales to 64+."
 }
 
-variable "enable_gpu" {
-  type        = bool
-  default     = true
-  description = "Whether to deploy the nc4as-t4-v3 GPU partition."
-}
-
-variable "nc4as_t4_v3_units" {
-  type        = number
-  default     = 1
-  description = "Number of NC4as_T4_v3 GPU compute nodes. Scales for multi-node GPU HPL with NCCL."
-}
-
 variable "ubuntu_series" {
   type        = string
   default     = "24.04"
@@ -48,6 +36,17 @@ variable "ubuntu_series" {
   validation {
     condition     = contains(["24.04", "26.04"], var.ubuntu_series)
     error_message = "ubuntu_series must be either 24.04 or 26.04."
+  }
+}
+
+# Compute partitions derived from CLI variables. Used by the slurmd module
+# and the filesystem-client integration for_each.
+locals {
+  compute_partitions = {
+    "hb120rs-v3" : {
+      constraints = "arch=amd64 instance-type=Standard_HB120rs_v3",
+      units       = var.hb120rs_v3_units,
+    },
   }
 }
 
@@ -116,98 +115,234 @@ resource "juju_model" "charmed-hpc" {
   }
 }
 
-# --- NFS share ---
+# --- NFS share (Azure storage + private endpoint, inlined because the
+# upstream charmed-hpc-terraform//modules/nfs/azure wrapper is incompatible
+# with the current filesystem-charms interface that requires model_uuid). ---
 
-module "nfs-share" {
-  source = "git::https://github.com/canonical/charmed-hpc-terraform//modules/azure-managed-nfs"
+resource "azurerm_storage_account" "nfs" {
+  name                     = "azure${substr(md5(azurerm_resource_group.nfs-group.id), 0, 8)}"
+  resource_group_name      = azurerm_resource_group.nfs-group.name
+  location                 = azurerm_resource_group.nfs-group.location
+  account_tier             = "Premium"
+  account_kind             = "FileStorage"
+  account_replication_type = "LRS"
 
-  name                = "azure-scale-nfs-share"
+  # Azure NFS does not support HTTPS.
+  https_traffic_only_enabled = false
+}
+
+resource "azurerm_storage_share" "nfs" {
+  name               = "nfs-home"
+  storage_account_id = azurerm_storage_account.nfs.id
+  quota              = 100
+  enabled_protocol   = "NFS"
+}
+
+resource "azurerm_private_dns_zone" "nfs" {
+  name                = "privatelink.file.core.windows.net"
   resource_group_name = azurerm_resource_group.nfs-group.name
-  subnet_info = {
-    name                 = azurerm_subnet.nfs-subnet.name
-    virtual_network_name = azurerm_subnet.nfs-subnet.virtual_network_name
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "nfs" {
+  name                  = "nfs-dz-vnet-link"
+  resource_group_name   = azurerm_resource_group.nfs-group.name
+  private_dns_zone_name = azurerm_private_dns_zone.nfs.name
+  virtual_network_id    = azurerm_virtual_network.nfs-vnet.id
+}
+
+resource "azurerm_private_endpoint" "nfs" {
+  name                = "azure-scale-nfs-endpoint"
+  location            = azurerm_resource_group.nfs-group.location
+  resource_group_name = azurerm_resource_group.nfs-group.name
+  subnet_id           = azurerm_subnet.nfs-subnet.id
+
+  private_service_connection {
+    name                           = "nfs-privateserviceconnection"
+    private_connection_resource_id = azurerm_storage_account.nfs.id
+    subresource_names              = ["file"]
+    is_manual_connection           = false
   }
-  model_name = juju_model.charmed-hpc.name
-  quota      = 100
-  mountpoint = "/nfs/home"
-  depends_on = [
-    azurerm_resource_group.nfs-group
-  ]
+
+  private_dns_zone_group {
+    name                 = "nfs-dz-group"
+    private_dns_zone_ids = [azurerm_private_dns_zone.nfs.id]
+  }
+}
+
+module "nfs-server-proxy" {
+  source    = "git::https://github.com/canonical/filesystem-charms//charms/nfs-server-proxy/terraform"
+  app_name  = "nfs-server-proxy"
+  model_uuid = juju_model.charmed-hpc.uuid
+  config = {
+    hostname = azurerm_storage_account.nfs.primary_file_host
+    path     = "/${azurerm_storage_account.nfs.name}/${azurerm_storage_share.nfs.name}"
+  }
+  depends_on = [azurerm_private_endpoint.nfs]
+}
+
+module "filesystem-client" {
+  source    = "git::https://github.com/canonical/filesystem-charms//charms/filesystem-client/terraform"
+  app_name  = "filesystem-client"
+  model_uuid = juju_model.charmed-hpc.uuid
+  config = {
+    mountpoint = "/nfs/home"
+  }
+}
+
+resource "juju_integration" "nfs-server-proxy-to-filesystem-client" {
+  model_uuid = juju_model.charmed-hpc.uuid
+
+  application {
+    name     = "nfs-server-proxy"
+    endpoint = module.nfs-server-proxy.provides.filesystem
+  }
+
+  application {
+    name     = "filesystem-client"
+    endpoint = module.filesystem-client.requires.filesystem
+  }
 }
 
 # --- MySQL (backing database for Slurm accounting) ---
 
 module "mysql" {
-  source = "git::https://github.com/canonical/mysql-operator//terraform"
+  # Pin ref=main: the repo's default branch was changed to "readme" (no code).
+  source = "git::https://github.com/canonical/mysql-operator//terraform?ref=main"
 
-  juju_model_name = juju_model.charmed-hpc.name
-  app_name        = "mysql"
-  channel         = "8.0/stable"
-  units           = 1
+  model    = juju_model.charmed-hpc.uuid
+  app_name = "mysql"
+  channel  = "8.0/stable"
+  units    = 1
 }
 
-# --- Slurm cluster ---
+# --- Slurm cluster (inlined because the upstream
+# charmed-hpc-terraform//modules/slurm wrapper passes model_name to
+# slurm-charms submodules that now require model_uuid). ---
 
-module "slurm" {
-  source = "git::https://github.com/canonical/charmed-hpc-terraform//modules/slurm"
+module "slurmctld" {
+  source     = "git::https://github.com/canonical/slurm-charms//charms/slurmctld/terraform"
+  app_name   = "slurmctld"
+  model_uuid = juju_model.charmed-hpc.uuid
+}
 
-  model_name = juju_model.charmed-hpc.name
-  database_backend = {
-    name     = module.mysql.application_name,
+module "slurmdbd" {
+  source     = "git::https://github.com/canonical/slurm-charms//charms/slurmdbd/terraform"
+  app_name   = "slurmdbd"
+  model_uuid = juju_model.charmed-hpc.uuid
+}
+
+module "slurmrestd" {
+  source     = "git::https://github.com/canonical/slurm-charms//charms/slurmrestd/terraform"
+  app_name   = "slurmrestd"
+  model_uuid = juju_model.charmed-hpc.uuid
+}
+
+module "sackd" {
+  source     = "git::https://github.com/canonical/slurm-charms//charms/sackd/terraform"
+  app_name   = "login"
+  model_uuid = juju_model.charmed-hpc.uuid
+  units      = 1
+}
+
+module "slurmd" {
+  source      = "git::https://github.com/canonical/slurm-charms//charms/slurmd/terraform"
+  for_each    = local.compute_partitions
+  app_name    = each.key
+  model_uuid  = juju_model.charmed-hpc.uuid
+  units       = each.value.units
+  constraints = each.value.constraints
+}
+
+resource "juju_integration" "sackd-to-slurmctld" {
+  model_uuid = juju_model.charmed-hpc.uuid
+
+  application {
+    name     = "login"
+    endpoint = module.sackd.provides.slurmctld
+  }
+
+  application {
+    name     = "slurmctld"
+    endpoint = module.slurmctld.requires.sackd
+  }
+}
+
+resource "juju_integration" "slurmdbd-to-slurmctld" {
+  model_uuid = juju_model.charmed-hpc.uuid
+
+  application {
+    name     = "slurmdbd"
+    endpoint = module.slurmdbd.provides.slurmctld
+  }
+
+  application {
+    name     = "slurmctld"
+    endpoint = module.slurmctld.requires.slurmdbd
+  }
+}
+
+resource "juju_integration" "slurmrestd-to-slurmctld" {
+  model_uuid = juju_model.charmed-hpc.uuid
+
+  application {
+    name     = "slurmrestd"
+    endpoint = module.slurmrestd.provides.slurmctld
+  }
+
+  application {
+    name     = "slurmctld"
+    endpoint = module.slurmctld.requires.slurmrestd
+  }
+}
+
+resource "juju_integration" "slurmdbd-to-mysql" {
+  model_uuid = juju_model.charmed-hpc.uuid
+
+  application {
+    name     = "slurmdbd"
+    endpoint = module.slurmdbd.requires.database
+  }
+
+  application {
+    name     = module.mysql.app_name
     endpoint = module.mysql.provides.database
   }
+}
 
-  controller = {
-    app_name = "slurmctld"
+resource "juju_integration" "slurmd-to-slurmctld" {
+  model_uuid = juju_model.charmed-hpc.uuid
+  for_each   = local.compute_partitions
+
+  application {
+    name     = each.key
+    endpoint = module.slurmd[each.key].provides.slurmctld
   }
 
-  database = {
-    app_name = "slurmdbd"
+  application {
+    name     = "slurmctld"
+    endpoint = module.slurmctld.requires.slurmd
   }
-
-  rest_api = {
-    app_name = "slurmrestd"
-  }
-
-  kiosk = {
-    app_name = "login",
-    units    = 1,
-  }
-
-  compute_partitions = {
-    "hb120rs-v3" : {
-      constraints = "arch=amd64 instance-type=Standard_HB120rs_v3",
-      units       = var.hb120rs_v3_units,
-    },
-    "nc4as-t4-v3" : {
-      constraints = "arch=amd64 instance-type=Standard_NC4as_T4_v3",
-      units       = var.enable_gpu ? var.nc4as_t4_v3_units : 0,
-    }
-  }
-  depends_on = [
-    juju_model.charmed-hpc
-  ]
 }
 
 # --- NFS integrations ---
 
 resource "juju_integration" "login-to-filesystem-client" {
-  model = juju_model.charmed-hpc.name
+  model_uuid = juju_model.charmed-hpc.uuid
 
   application {
-    name     = module.slurm.kiosk.app_name
+    name     = "login"
     endpoint = "juju-info"
   }
 
   application {
-    name     = module.nfs-share.app_name
-    endpoint = "juju-info"
+    name     = "filesystem-client"
+    endpoint = module.filesystem-client.requires.juju_info
   }
 }
 
 resource "juju_integration" "compute-to-filesystem-client" {
-  model    = juju_model.charmed-hpc.name
-  for_each = module.slurm.compute_partitions
+  model_uuid = juju_model.charmed-hpc.uuid
+  for_each   = local.compute_partitions
 
   application {
     name     = each.key
@@ -215,8 +350,8 @@ resource "juju_integration" "compute-to-filesystem-client" {
   }
 
   application {
-    name     = module.nfs-share.app_name
-    endpoint = "juju-info"
+    name     = "filesystem-client"
+    endpoint = module.filesystem-client.requires.juju_info
   }
 }
 
@@ -228,14 +363,6 @@ output "model_name" {
 
 output "compute_node_count" {
   value = var.hb120rs_v3_units
-}
-
-output "gpu_enabled" {
-  value = var.enable_gpu
-}
-
-output "gpu_node_count" {
-  value = var.enable_gpu ? var.nc4as_t4_v3_units : 0
 }
 
 output "ubuntu_series" {

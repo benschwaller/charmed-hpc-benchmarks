@@ -44,9 +44,11 @@ def fmt_delta(juju, baseline):
         return "N/A"
     delta = juju - baseline
     if baseline == 0:
-        pct = float("inf")
-    else:
-        pct = (delta / baseline) * 100
+        if delta == 0:
+            return "0.00s (—)"
+        sign = "+" if delta >= 0 else ""
+        return f"{sign}{delta:.2f}s (new)"
+    pct = (delta / baseline) * 100
     sign = "+" if delta >= 0 else ""
     return f"{sign}{delta:.2f}s ({sign}{pct:.1f}%)"
 
@@ -97,7 +99,8 @@ def compare_timing(juju_data, baseline_data):
             b_val = baseline_data["phases"][phase].get("duration_seconds")
 
         lines.append(
-            f"| {phase} | {fmt_seconds(j_val)} | {fmt_seconds(b_val)} | {fmt_delta(j_val, b_val) if j_val and b_val else 'N/A'} |"
+            f"| {phase} | {fmt_seconds(j_val)} | {fmt_seconds(b_val)} | "
+            f"{fmt_delta(j_val, b_val) if j_val is not None and b_val is not None else 'N/A'} |"
         )
 
     # Totals
@@ -138,7 +141,8 @@ def compare_timing(juju_data, baseline_data):
             else None
         )
         lines.append(
-            f"| {app} | {fmt_seconds(j_val)} | {fmt_seconds(b_val)} | {fmt_delta(j_val, b_val) if j_val and b_val else 'N/A'} |"
+            f"| {app} | {fmt_seconds(j_val)} | {fmt_seconds(b_val)} | "
+            f"{fmt_delta(j_val, b_val) if j_val is not None and b_val is not None else 'N/A'} |"
         )
 
     return "\n".join(lines)
@@ -178,14 +182,18 @@ def compare_perflogs(juju_dir, baseline_dir):
             j_display = f"{j_val[0]:.2f}{unit}" if j_val else "N/A"
             b_display = f"{b_val[0]:.2f}{unit}" if b_val else "N/A"
 
-            if j_val and b_val:
+            if j_val is not None and b_val is not None:
                 delta = j_val[0] - b_val[0]
-                if b_val[0] != 0:
-                    pct = (delta / b_val[0]) * 100
+                if b_val[0] == 0:
+                    if delta == 0:
+                        overhead = f"0.00{unit} (—)"
+                    else:
+                        sign = "+" if delta >= 0 else ""
+                        overhead = f"{sign}{delta:.2f}{unit} (new)"
                 else:
-                    pct = float("inf")
-                sign = "+" if delta >= 0 else ""
-                overhead = f"{sign}{delta:.2f}{unit} ({sign}{pct:.1f}%)"
+                    pct = (delta / b_val[0]) * 100
+                    sign = "+" if delta >= 0 else ""
+                    overhead = f"{sign}{delta:.2f}{unit} ({sign}{pct:.1f}%)"
             else:
                 overhead = "N/A"
 
@@ -217,18 +225,6 @@ def parse_perflogs(perflogs_dir):
                         if len(vals) < len(cols):
                             continue
                         row = dict(zip(cols, vals))
-                        for col in cols:
-                            if col in (
-                                "job_completion_time",
-                                "case",
-                                "num_tasks",
-                                "num_tasks_per_node",
-                                "num_nodes",
-                                "num_cpus_per_task",
-                                "num_gpus_per_node",
-                            ):
-                                continue
-
                         if "perf_var" in row and "perf_value" in row:
                             try:
                                 val = float(row["perf_value"])

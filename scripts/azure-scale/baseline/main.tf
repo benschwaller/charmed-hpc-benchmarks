@@ -22,12 +22,6 @@ variable "compute_nodes" {
   description = "Number of HB120rs_v3 compute nodes."
 }
 
-variable "enable_gpu" {
-  type        = bool
-  default     = true
-  description = "Whether to deploy a GPU node."
-}
-
 variable "ubuntu_series" {
   type        = string
   default     = "24.04"
@@ -39,15 +33,20 @@ variable "ubuntu_series" {
   }
 }
 
+variable "ssh_public_key" {
+  type        = string
+  description = "SSH public key for VM access."
+}
+
 locals {
+  # Canonical publishes each LTS under its own offer. The gen2 SKU is "server".
   ubuntu_image = {
-    "24.04" = "ubuntu-24_04-lts"
-    "26.04" = "ubuntu-26_04-lts"
+    "24.04" = { offer = "ubuntu-24_04-lts", sku = "server" }
+    "26.04" = { offer = "ubuntu-26_04-lts", sku = "server" }
   }[var.ubuntu_series]
 
-  login_vm_size  = "Standard_D4s_v5"
+  login_vm_size   = "Standard_D4s_v5"
   compute_vm_size = "Standard_HB120rs_v3"
-  gpu_vm_size     = "Standard_NC4as_T4_v3"
 }
 
 # --- Resource group & networking ---
@@ -133,8 +132,8 @@ resource "azurerm_linux_virtual_machine" "login" {
 
   source_image_reference {
     publisher = "Canonical"
-    offer     = "0001-com-ubuntu-server-jammy"
-    sku       = local.ubuntu_image
+    offer     = local.ubuntu_image.offer
+    sku       = local.ubuntu_image.sku
     version   = "latest"
   }
 
@@ -145,14 +144,8 @@ resource "azurerm_linux_virtual_machine" "login" {
 
   admin_ssh_key {
     username   = "ubuntu"
-    public_key = fileexists("~/.ssh/id_rsa.pub") ? file("~/.ssh/id_rsa.pub") : var.ssh_public_key
+    public_key = var.ssh_public_key
   }
-}
-
-variable "ssh_public_key" {
-  type        = string
-  default     = ""
-  description = "SSH public key for VM access. Falls back to ~/.ssh/id_rsa.pub."
 }
 
 # --- Compute nodes ---
@@ -181,8 +174,8 @@ resource "azurerm_linux_virtual_machine" "compute" {
 
   source_image_reference {
     publisher = "Canonical"
-    offer     = "0001-com-ubuntu-server-jammy"
-    sku       = local.ubuntu_image
+    offer     = local.ubuntu_image.offer
+    sku       = local.ubuntu_image.sku
     version   = "latest"
   }
 
@@ -193,49 +186,7 @@ resource "azurerm_linux_virtual_machine" "compute" {
 
   admin_ssh_key {
     username   = "ubuntu"
-    public_key = var.ssh_public_key != "" ? var.ssh_public_key : file("~/.ssh/id_rsa.pub")
-  }
-}
-
-# --- GPU node (conditional) ---
-
-resource "azurerm_network_interface" "gpu" {
-  count               = var.enable_gpu ? 1 : 0
-  name                = "baseline-gpu-nic"
-  location            = azurerm_resource_group.baseline.location
-  resource_group_name = azurerm_resource_group.baseline.name
-
-  ip_configuration {
-    name                          = "internal"
-    subnet_id                     = azurerm_subnet.baseline.id
-    private_ip_address_allocation = "Dynamic"
-  }
-}
-
-resource "azurerm_linux_virtual_machine" "gpu" {
-  count                = var.enable_gpu ? 1 : 0
-  name                 = "baseline-gpu"
-  location             = azurerm_resource_group.baseline.location
-  resource_group_name = azurerm_resource_group.baseline.name
-  size                 = local.gpu_vm_size
-  admin_username       = "ubuntu"
-  network_interface_ids = [azurerm_network_interface.gpu[0].id]
-
-  source_image_reference {
-    publisher = "Canonical"
-    offer     = "0001-com-ubuntu-server-jammy"
-    sku       = local.ubuntu_image
-    version   = "latest"
-  }
-
-  os_disk {
-    caching              = "ReadWrite"
-    storage_account_type = "Premium_LRS"
-  }
-
-  admin_ssh_key {
-    username   = "ubuntu"
-    public_key = var.ssh_public_key != "" ? var.ssh_public_key : file("~/.ssh/id_rsa.pub")
+    public_key = var.ssh_public_key
   }
 }
 
@@ -247,10 +198,6 @@ output "login_public_ip" {
 
 output "compute_node_count" {
   value = var.compute_nodes
-}
-
-output "gpu_enabled" {
-  value = var.enable_gpu
 }
 
 output "ubuntu_series" {

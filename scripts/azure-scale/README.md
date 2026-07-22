@@ -1,8 +1,8 @@
 # Azure-Scale Charmed-HPC Benchmarking
 
-Comprehensive benchmarking infrastructure for measuring Charmed-HPC cluster
-instantiation time, Juju/charm overhead, and HPC workload performance at scale
-on Microsoft Azure.
+Benchmarking infrastructure for measuring Charmed-HPC cluster instantiation
+time, Juju/charm overhead, and multi-node CPU HPC workload performance at
+scale on Microsoft Azure.
 
 ## Overview
 
@@ -14,10 +14,14 @@ questions:
 2. **How does that compare to a raw VM deployment with manually-installed
    Slurm (no Juju)?**
 
-To answer these, the suite deploys a Slurm cluster on Azure via Juju, runs
-a comprehensive ReFrame benchmark suite, tears it down, then deploys raw
-Azure VMs with manual Slurm, runs the same benchmarks, and produces a
-side-by-side comparison report.
+To answer these, the suite deploys a Slurm cluster on Azure via Juju, runs a
+multi-node CPU ReFrame benchmark suite, tears it down, then deploys raw Azure
+VMs with manual Slurm, runs the same benchmarks, and produces a side-by-side
+comparison report.
+
+> **CPU-only.** This suite targets the RDMA-enabled `Standard_HB120rs_v3` CPU
+> partition. There is no GPU partition or GPU benchmark here; single-node GPU
+> tests live in the top-level `scripts/azure` pipeline.
 
 ## Architecture
 
@@ -48,11 +52,11 @@ before the baseline VMs are provisioned, minimizing Azure quota pressure.
 
 ```bash
 # Full pipeline: Juju → teardown → baseline → teardown → compare
-./run_all.sh --nodes 64 --gpu false --ubuntu 24.04 --repeats 5
+./run_all.sh --nodes 64 --ubuntu 24.04 --repeats 5
 
 # Or run each phase separately:
-./run_azure_scale.sh --nodes 64 --gpu false --ubuntu 24.04 --repeats 5
-./baseline/run_baseline.sh --nodes 64 --gpu false --ubuntu 24.04 --repeats 5
+./run_azure_scale.sh --nodes 64 --ubuntu 24.04 --repeats 5
+./baseline/run_baseline.sh --nodes 64 --ubuntu 24.04 --repeats 5
 python3 compare.py --juju juju_timing_report.json --baseline baseline_timing_report.json
 ```
 
@@ -61,16 +65,21 @@ python3 compare.py --juju juju_timing_report.json --baseline baseline_timing_rep
 | Parameter | Default | Values | Description |
 |-----------|---------|--------|-------------|
 | `--nodes` | 2 | Any positive integer (64+ for large scale) | Number of HB120rs_v3 CPU compute nodes |
-| `--gpu` | true | `true` / `false` | Whether to deploy the nc4as-t4-v3 GPU partition |
-| `--gpu_nodes` | 1 | Any positive integer | Number of NC4as_T4_v3 GPU nodes (for multi-node GPU HPL with NCCL) |
 | `--ubuntu` | 24.04 | `24.04` / `26.04` | Ubuntu LTS series |
 | `--repeats` | 5 | Any positive integer (min 5 recommended) | Repetitions per full-cluster benchmark |
+| `--repo` | `canonical/charmed-hpc-benchmarks` | Any git URL | Repo cloned on the login node to source the checks |
+| `--ref` | `main` | Any branch/tag/commit | Git ref checked out on the login node |
+
+> **Testing a feature branch.** The login node clones the suite from git. To
+> run checks that are not yet merged, pass `--repo <your-fork-url> --ref
+> <your-branch>`. This is required because the login node does not have access
+> to your local working tree.
 
 ## ReFrame Checks
 
 The pipeline runs checks from two directories:
 - `../../checks` — the existing top-level charmed-hpc-benchmarks checks
-- `checks/` — new checks specific to this scaling suite
+- `checks/` — checks specific to this scaling suite
 
 Point-to-point and single-node checks (OSU pt2pt, IMB pingpong, gpu_burn, fio,
 slurmdbd, slurmrestd) are **excluded** via ReFrame's `-n` name filter — this
@@ -79,52 +88,51 @@ overhead.
 
 ### Full-cluster tests (each repeated N× via `--repeats`)
 
-| Check | Source | Nodes used | What it measures |
+| Check | Source | Tasks used | What it measures |
 |-------|--------|-----------|------------------|
-| `charmed_osu_collective_check` | `../../checks` | All N | OSU MPI collective (allreduce, alltoall) |
-| `imb_allreduce_check` | `../../checks` | All N | Intel MPI allreduce latency |
-| `hpl_cpu_check` | `checks/` | All N | Peak FLOPS, full cluster |
-| `hpcg_check` | `checks/` | All N | Memory bandwidth / latency stress |
-| `hpl_gpu_check` | `checks/` | All GPU nodes | Multi-node GPU LINPACK via NCCL |
+| `charmed_osu_collective_check` | `../../checks` | 1 rank/node | OSU MPI collective (allreduce, alltoall) |
+| `imb_allreduce_check` | `../../checks` | 1 rank/node | Intel MPI allreduce latency |
+| `hpl_cpu_check` | `checks/` | 1 rank/core | Peak FLOPS, full cluster |
+| `hpcg_check` | `checks/` | 1 rank/core | Memory bandwidth / latency stress |
 | `juju_agent_overhead` | `checks/` | 1 per partition | jujud/snapd CPU/RAM, aggregate Juju overhead, disk usage |
 | `slurm_dispatch_latency` | `checks/` | 1 (login → compute) | srun/sbatch/sinfo/scontrol latency |
 
-### Concurrent split-cluster tests (single run, requires `--nodes >= 4`)
+### Concurrent split-cluster tests (single run, requires `--nodes >= 4` for HPL, `--nodes >= 8` for OSU)
 
 | Check | Source | Layout | What it demonstrates |
 |-------|--------|--------|----------------------|
-| `hpl_concurrent_check` | `checks/` | Two HPL jobs on N/2 nodes each, simultaneously | Scheduler concurrency + full performance under load |
-| `osu_concurrent_check` | `checks/` | Two osu_bw jobs on separate node pairs, simultaneously | RDMA network handles concurrent traffic |
+| `hpl_concurrent_check` | `checks/` | Four HPL jobs on N/4 nodes each, simultaneously | Scheduler concurrency + full performance under load |
+| `osu_concurrent_check` | `checks/` | Four osu_bw jobs on separate node pairs, simultaneously | RDMA network handles concurrent traffic |
 
-Concurrent checks always run once regardless of `--repeats`.
+Concurrent checks self-skip when fewer nodes are available than required.
+They run once regardless of `--repeats` (they submit their own sbatch jobs
+internally).
 
-### Check selection
+### `num_tasks` conventions
 
-The ReFrame invocation uses `-n` to select only multi-node and infrastructure
-checks:
+The orchestrator computes task counts from `--nodes` and passes them via
+`--setvar`:
 
-```bash
-reframe ... \
-  -n 'charmed_osu_collective_check|imb_allreduce_check|hpl_cpu_check|hpl_gpu_check|hpcg_check|hpl_concurrent_check|osu_concurrent_check|juju_agent_overhead|slurm_dispatch_latency' \
-  --setvar charmed_osu_collective_check.num_tasks="${NUM_TASKS}" \
-  --setvar imb_allreduce_check.num_tasks="${NUM_TASKS}" \
-  --setvar hpl_cpu_check.num_tasks="${NUM_TASKS}" \
-  --setvar hpcg_check.num_tasks="${NUM_TASKS}" \
-  --setvar hpl_concurrent_check.num_tasks="${HALF_TASKS}" \
-  --setvar hpl_gpu_check.num_tasks="${GPU_NODES}"
-```
+- **Per-core checks** (`hpl_cpu_check`, `hpcg_check`, and the concurrent
+  checks' internal task budget): `nodes × 120`.
+- **Collective checks** (`charmed_osu_collective_check`, `imb_allreduce_check`,
+  which pin `num_tasks_per_node = 1`): `nodes` (one rank per node).
 
 ### Automatic problem sizing
 
-HPL and HPCG generate their `.dat` input files at runtime based on `num_tasks`
-and available memory per node. The P×Q process grid is factored from
-`num_tasks` to be as square as possible. For HPL:
+HPL and HPCG generate their input files at runtime.
 
-- **CPU**: N = `sqrt(nodes × 400GB × 1e9 / 8)`, NB=384
-- **GPU**: N = `sqrt(gpu_nodes × 14GB × 1e9 / 8)`, NB=256
+- **HPL** (`checks/hpl/hpl.py`): the P×Q grid is factored from `num_tasks` to
+  be as square as possible; problem size `N = sqrt(nodes × 400GB × 1e9 / 8)`
+  rounded to a multiple of `NB=384`. The result-line regex anchors on the
+  stable HPL column layout rather than a hardcoded run tag.
+- **HPCG** (`checks/hpcg/hpcg.py`): fixed per-rank local dimensions
+  (104³); the global problem grows with rank count. The `hpcg.dat` uses the
+  correct `nx ny nz` single-line format.
 
-The `num_tasks` values are computed from `--nodes` and `--gpu_nodes` in the
-orchestrator scripts and passed via `--setvar`.
+Both `hpl_cpu_check` and `hpcg_check` build their binary via a ReFrame build
+fixture (`build_hpl_cpu`, `build_hpcg`) and execute it from the fixture's
+stage directory — the binaries are not assumed to be on `PATH`.
 
 ## Workstreams
 
@@ -134,7 +142,8 @@ orchestrator scripts and passed via `--setvar`.
 
 Instruments every phase of the deployment pipeline with structured timing.
 During the wait-for-active loop, per-application readiness is tracked — the
-first time each application flips to `active` is recorded.
+first time each application flips to `active` is recorded. All numeric values
+are normalized to valid JSON before being written.
 
 **Phases timed:**
 
@@ -143,16 +152,14 @@ first time each application flips to `active` is recorded.
 | `bootstrap` | `juju bootstrap azure` controller creation |
 | `tofu_apply` | `tofu init && tofu apply` (Azure provisioning + charm deployment) |
 | `wait_active` | Polling loop until all applications report `active` |
-| `node_configured_gpu` | `node-configured` action on GPU partition |
-| `node_configured_cpu` | `node-configured` action on all CPU compute units (parallelized) |
-| `install_deps` | Package installation (libcublas, NCCL, build tools) |
-| `reframe_suite` | ReFrame installation + full benchmark suite execution |
+| `node_configured` | `node-configured` action on all CPU compute units (parallelized) |
+| `install_deps` | Placeholder phase; build tooling is installed in the ReFrame phase |
+| `reframe_suite` | ReFrame installation + benchmark suite execution |
 | `copy_results` | `scp` of perflogs and output directories |
 | `teardown_tofu` | `tofu destroy` (with retry logic) |
 | `teardown_juju` | `juju destroy-controller` |
 
-**Output:** `juju_timing_report.json` (Juju) / `baseline_timing_report.json`
-(baseline) with the following schema:
+**Output:** `juju_timing_report.json` / `baseline_timing_report.json`:
 
 ```json
 {
@@ -160,16 +167,15 @@ first time each application flips to `active` is recorded.
   "deployment_type": "juju",
   "phases": {
     "bootstrap": {"start": ..., "end": ..., "duration_seconds": 85.3},
-    ...
+    "...": {}
   },
   "application_readiness": {
-    "mysql": {"seconds_from_wait_start": 45.2},
-    ...
+    "mysql": {"seconds_from_wait_start": 45.2}
   },
   "totals": {
-    "spinup_seconds": ...,
-    "teardown_seconds": ...,
-    "total_seconds": ...
+    "spinup_seconds": 0.0,
+    "teardown_seconds": 0.0,
+    "total_seconds": 0.0
   }
 }
 ```
@@ -178,112 +184,91 @@ first time each application flips to `active` is recorded.
 
 **File:** `checks/infrastructure/juju_overhead.py`
 
-Measures the full resource footprint of the Juju/charm infrastructure — not
-just `jujud`, but all Juju-related processes including `snapd`, `juju-run`,
-and charm hook helpers. On the baseline (raw VM) pipeline these metrics will
-be zero, making the overhead directly measurable as the delta between pipelines.
+Measures the resource footprint of the Juju/charm infrastructure. Processes
+are matched by command-line pattern (jujud runs as `jujud-machine-N`), and the
+collection logic is written to a script file to avoid fragile nested quoting.
+On the baseline pipeline the jujud/aggregate metrics are zero; snapd is
+reported separately because it also exists on non-Juju hosts.
 
 | Metric | Unit | Description |
 |--------|------|-------------|
-| `jujud_cpu_percent` | % | CPU usage of jujud process |
-| `jujud_rss_mb` | MB | Resident memory of jujud |
-| `jujud_threads` | count | Thread count of jujud |
-| `snapd_cpu_percent` | % | CPU usage of snapd (charm runtime) |
-| `snapd_rss_mb` | MB | Resident memory of snapd |
-| `total_juju_cpu_percent` | % | Aggregate CPU of all Juju-related processes |
-| `total_juju_rss_mb` | MB | Aggregate RSS of all Juju-related processes |
-| `juju_disk_mb` | MB | Disk usage of `/var/lib/juju` (state) |
-| `juju_log_disk_mb` | MB | Disk usage of `/var/log/juju` (logs) |
+| `jujud_cpu_percent` / `jujud_rss_mb` / `jujud_threads` | %, MB, count | jujud agent footprint |
+| `snapd_cpu_percent` / `snapd_rss_mb` | %, MB | snapd (present on baseline too) |
+| `total_juju_cpu_percent` / `total_juju_rss_mb` | %, MB | Aggregate of all Juju-related processes |
+| `juju_disk_mb` / `juju_log_disk_mb` | MB | `/var/lib/juju` and `/var/log/juju` usage |
 
 ### 3. Slurm Scheduling Latency Check
 
 **File:** `checks/infrastructure/slurm_latency.py`
 
-| Metric | Unit | Reference | Description |
-|--------|------|-----------|-------------|
-| `srun_latency` | s | 2.0 | `srun hostname` dispatch time |
-| `sinfo_latency` | s | 0.5 | `sinfo` query time |
-| `scontrol_latency` | s | 0.5 | `scontrol show nodes` time |
-| `sbatch_latency` | s | 3.0 | Time from `sbatch` to job start |
+Reference values are permissive upper bounds intended to catch gross
+regressions (e.g. a wedged controller), not tight performance targets.
+
+| Metric | Unit | Description |
+|--------|------|-------------|
+| `srun_latency` | s | `srun hostname` dispatch time |
+| `sinfo_latency` | s | `sinfo` query time |
+| `scontrol_latency` | s | `scontrol show nodes` time |
+| `sbatch_latency` | s | Time from `sbatch` to job start |
 
 ### 4. HPL + HPCG Benchmarks
 
 **Files:** `checks/hpl/hpl.py`, `checks/hpl/hpl_concurrent.py`,
 `checks/hpl/src/Make.Linux_PII_FBLAS`, `checks/hpcg/hpcg.py`
 
-#### HPL (High-Performance Linpack)
-
-| Variant | Partition | Build Method | Scales? |
-|---------|-----------|--------------|---------|
-| CPU HPL | `hb120rs-v3` | netlib source + OpenBLAS | Yes — P×Q auto-calculated from `num_tasks` |
-| GPU HPL | `nc4as-t4-v3` | NVIDIA pre-built binary + NCCL | Yes — multi-node over Ethernet (no RDMA) |
-
-GPU HPL uses NCCL for inter-GPU communication. The NC4as_T4_v3 instances have
-no RDMA, so NCCL runs over TCP (`NCCL_NET=Socket`, `NCCL_SOCKET_IFNAME=eth0`).
-
-#### HPCG
-
-Runs on the CPU partition, scales to N nodes.
-
-#### Concurrent Split-Cluster Tests
-
-Two HPL jobs and two OSU bandwidth jobs submitted simultaneously to Slurm,
-each using half the cluster. Verifies true concurrency via `sacct`.
+- **HPL (CPU)** — built from netlib source against OpenBLAS on `hb120rs-v3`,
+  scaling to N nodes with an auto-calculated P×Q grid.
+- **HPCG** — built from source with MPI on `hb120rs-v3`, scaling to N nodes.
+- **Concurrent split-cluster** — four HPL jobs and four OSU bandwidth jobs
+  submitted simultaneously, each using a quarter of the cluster / separate
+  node pairs, with overlap confirmed via `sacct`.
 
 | Metric | Description |
 |--------|-------------|
-| `job_a_gflops` / `job_b_gflops` | Per-half-cluster HPL performance |
-| `total_wall_seconds` | Wall-clock for both to complete |
-| `concurrency_gap_seconds` | Gap between job starts (should be near-zero) |
+| `job_a_gflops` / `job_b_gflops` / `job_c_gflops` / `job_d_gflops` | Per-quarter-cluster HPL performance |
+| `total_wall_seconds` | Wall-clock for all four to complete |
+| `concurrency_gap_seconds` | Max gap between job starts (near-zero when concurrent) |
 
 ### 5. Raw VM Baseline Comparison
 
 **Files:** `baseline/run_baseline.sh`, `baseline/main.tf`,
 `baseline/setup_slurm.sh`
 
-Deploys the same Azure VMs **without Juju/charms**, manually installs Slurm
-via bash scripts, and runs the same ReFrame suite.
+Deploys the same Azure CPU VMs **without Juju/charms**, manually installs
+Slurm via bash, and runs the same ReFrame suite.
 
-**`baseline/setup_slurm.sh`** manually installs:
-1. Munge on all nodes (shared key for Slurm auth)
-2. Slurm — slurmctld on login, slurmd on compute nodes
+**`baseline/setup_slurm.sh`** installs:
+1. Munge + Slurm packages on login node (shared key for Slurm auth)
+2. Munge + Slurm + MPI packages on compute nodes (key distributed from login)
 3. NFS — export `/nfs/home` from login, mount on compute nodes
-4. MPI — OpenMPI on all nodes
-5. CUDA + NCCL — toolkit + libcublas + libnccl on GPU nodes (if enabled)
-6. ReFrame — venv + clone repo + run same check suite
+4. Slurm configuration — slurmctld on login, slurmd on compute nodes (cgroup v2,
+   no slurmdbd; accounting text records are sufficient for `sacct` concurrency
+   checks)
+5. ReFrame — venv on the shared filesystem
 
 ### 6. Comparison Reporter
 
 **File:** `compare.py`
 
 Reads both timing report JSON files and optionally perflogs, producing a
-markdown comparison report with phase-by-phase timing, per-app readiness,
-and benchmark results.
+markdown comparison report with phase-by-phase timing, per-app readiness, and
+benchmark results. Handles legitimately-zero values correctly.
 
 **Output:** `comparison_report.md`
-
-## GPU Toggle
-
-When `--gpu false`:
-- The Terraform plan creates 0 GPU VMs
-- The ReFrame config omits the `nc4as-t4-v3` partition
-- GPU-specific checks are automatically skipped (target partition doesn't exist)
-- Only CPU HPL (from source with OpenBLAS) runs on `hb120rs-v3`
-
-When `--gpu true` (default):
-- `--gpu_nodes` controls how many NC4as_T4_v3 nodes to deploy (default: 1)
-- GPU HPL runs with NCCL across all GPU nodes
-- NCCL is installed via `apt-get install libnccl2 libnccl-dev`
 
 ## Ubuntu Version Support
 
 | Version | Codename | Status |
 |---------|----------|--------|
-| 24.04 | Noble Numbat | Default; proven stability; all charms support it |
-| 26.04 | (latest LTS) | Supported; verify charmed-hpc charm compatibility first |
+| 24.04 | Noble Numbat | Default; all charms support it |
+| 26.04 | (latest LTS) | **Verify charmed-hpc charm compatibility first** |
 
-The `UBUNTU_SERIES` environment variable is exported by the orchestrator
-scripts and consumed by the ReFrame config and Terraform plan at runtime.
+The Juju plan sets the model's `default-series` to the Ubuntu series version
+(e.g., `24.04`). Individual
+charms may still pin their own supported base, so `--ubuntu 26.04` only takes
+effect where the charms actually support it. The baseline plan selects the
+matching Azure image (`ubuntu-24_04-lts` / `ubuntu-26_04-lts`, SKU `server`).
+`UBUNTU_SERIES` is also exported for the ReFrame config's description string.
 
 ## Scaling to 64+ Nodes
 
@@ -292,14 +277,13 @@ scripts and consumed by the ReFrame config and Terraform plan at runtime.
 - **Wait-for-active loop** — polls `juju status --format=json` generically
 - **Per-app readiness tracking** — JSON parsing is app-agnostic
 - **`node-configured` action** — parallelized via `xargs -P 0`
-- **HPL/HPCG problem sizing** — `num_tasks` set via `--setvar`, P×Q grid
-  and problem size N auto-calculated from node count and available memory
-- **GPU HPL** — `num_tasks` set to `--gpu_nodes`, NCCL handles multi-node
+- **HPL/HPCG problem sizing** — `num_tasks` set via `--setvar`; P×Q grid and
+  problem size auto-calculated from node count and per-node memory
 
 ### Azure quota requirements
 
 64× `Standard_HB120rs_v3` = 7,680 vCPUs. Default Azure quota is usually
-10-100 vCPUs for HB-series. Request a quota increase via the Azure portal.
+10–100 vCPUs for HB-series. Request a quota increase via the Azure portal.
 
 ## Directory Structure
 
@@ -312,13 +296,13 @@ scripts/azure-scale/
 ├── timing_utils.sh                    # Shared bash timing library
 ├── compare.py                         # Side-by-side comparison reporter
 ├── config/
-│   └── azure_scale_config.py          # ReFrame config (GPU toggle via env var)
+│   └── azure_scale_config.py          # ReFrame config (CPU-only)
 ├── checks/
 │   ├── infrastructure/
-│   │   ├── juju_overhead.py           # jujud CPU/RAM/disk/threads
+│   │   ├── juju_overhead.py           # jujud/snapd CPU/RAM/disk/threads
 │   │   └── slurm_latency.py           # srun/sbatch/sinfo/scontrol latency
 │   ├── hpl/
-│   │   ├── hpl.py                     # CPU HPL (OpenBLAS) + GPU HPL (NCCL)
+│   │   ├── hpl.py                     # CPU HPL (OpenBLAS) build + run
 │   │   ├── hpl_concurrent.py          # Split-cluster concurrent HPL
 │   │   └── src/
 │   │       └── Make.Linux_PII_FBLAS   # HPL makefile for OpenBLAS
@@ -328,11 +312,11 @@ scripts/azure-scale/
 │       └── osu_concurrent.py          # Concurrent OSU bandwidth
 ├── templates/
 │   ├── HPL.dat.template               # Reference for HPL input format
-│   └── hpcg.dat.template             # Reference for HPCG input format
+│   └── hpcg.dat.template              # Reference for HPCG input format
 └── baseline/
     ├── run_baseline.sh                # Raw VM pipeline (same CLI flags)
-    ├── main.tf                        # Raw Azure VMs, no Juju
-    └── setup_slurm.sh                 # Bash manual Slurm + MPI + NCCL install
+    ├── main.tf                        # Raw Azure CPU VMs, no Juju
+    └── setup_slurm.sh                 # Bash manual Slurm + MPI install
 ```
 
 ## Prerequisites
@@ -373,8 +357,8 @@ ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa
 
 ## Existing Azure Pipeline
 
-This directory is separate from the existing `scripts/azure/` pipeline.
-The existing pipeline runs a fixed 2-node cluster with 27 ReFrame checks
-and is untouched by this work. This pipeline runs an expanded multi-node
-check suite from both `../../checks` and `checks/` using a self-contained
-ReFrame config.
+This directory is separate from the existing `scripts/azure/` pipeline. The
+existing pipeline runs a fixed 2-node cluster with the full single-node check
+suite (including GPU) and is untouched by this work. This pipeline runs an
+expanded multi-node CPU check suite from both `../../checks` and `checks/`
+using a self-contained ReFrame config.

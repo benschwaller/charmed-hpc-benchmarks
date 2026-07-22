@@ -17,6 +17,9 @@ TOUCH        = touch
 # --------------------------------------------------------------------
 # - HPL Directory Structure / HPL library ------------------------------
 # --------------------------------------------------------------------
+# TOPdir is rewritten to the absolute ReFrame stage directory at build time
+# by the build_hpl_cpu check (see hpl.py). netlib's leaf sub-makes cd into
+# subdirectories, so TOPdir must be an absolute constant.
 TOPdir       = $(HOME)/hpl
 INCdir       = $(TOPdir)/include
 BINdir       = $(TOPdir)/bin/$(ARCH)

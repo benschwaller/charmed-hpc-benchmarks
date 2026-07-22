@@ -10,7 +10,7 @@
 # VMs are never held simultaneously — the Juju cluster is fully torn down
 # before the baseline VMs are provisioned, minimizing Azure quota pressure.
 #
-# Usage: run_all.sh --nodes 64 --gpu false --gpu_nodes 4 --ubuntu 24.04 --repeats 5
+# Usage: run_all.sh --nodes 64 --ubuntu 24.04 --repeats 5 [--repo URL --ref REF]
 
 set -e
 
@@ -23,8 +23,6 @@ done
 
 # Default values if not provided
 NODES=2
-ENABLE_GPU=true
-GPU_NODES=1
 UBUNTU_SERIES=24.04
 REPEATS=5
 
@@ -33,8 +31,6 @@ i=0
 while [ $i -lt ${#ARGS[@]} ]; do
   case "${ARGS[$i]}" in
     --nodes) NODES="${ARGS[$((i+1))]}"; i=$((i+2)) ;;
-    --gpu) ENABLE_GPU="${ARGS[$((i+1))]}"; i=$((i+2)) ;;
-    --gpu_nodes) GPU_NODES="${ARGS[$((i+1))]}"; i=$((i+2)) ;;
     --ubuntu) UBUNTU_SERIES="${ARGS[$((i+1))]}"; i=$((i+2)) ;;
     --repeats) REPEATS="${ARGS[$((i+1))]}"; i=$((i+2)) ;;
     *) i=$((i+1)) ;;
@@ -47,8 +43,6 @@ echo "============================================================"
 echo "  Charmed-HPC Comprehensive Benchmarking Pipeline"
 echo "============================================================"
 echo "  Nodes:       ${NODES}"
-echo "  GPU:         ${ENABLE_GPU}"
-echo "  GPU Nodes:   ${GPU_NODES}"
 echo "  Ubuntu:      ${UBUNTU_SERIES}"
 echo "  Repeats:     ${REPEATS}"
 echo "  Started:     $(date)"

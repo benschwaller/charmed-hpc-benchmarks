@@ -1,11 +1,15 @@
-## HPCG.dat template — values substituted at runtime by ReFrame
-## Tokens like {{NTASKS}}, {{NX}}, {{NY}}, {{NZ}}, {{RT}} are replaced by the check.
+## hpcg.dat template — values substituted at runtime by the ReFrame check.
+## Tokens like {{NX}}, {{NY}}, {{NZ}}, {{RT}} are replaced by hpcg.py.
 ##
-## This file is kept for reference — the actual HPCG.dat is generated
-## programmatically in hpcg.py's prepare_hpcg_dat() method.
-
-{{NTASKS}}
-{{NX}}
-{{NY}}
-{{NZ}}
+## This file is kept for reference. The actual hpcg.dat is generated
+## programmatically in hpcg.py's prepare_run() method.
+##
+## Real HPCG input format:
+##   line 1: title/comment (ignored)
+##   line 2: comment (ignored)
+##   line 3: local problem dimensions "nx ny nz" on a single line
+##   line 4: measured run time in seconds (>= 60 for an official run)
+HPCG benchmark input file
+Charmed-HPC azure-scale
+{{NX}} {{NY}} {{NZ}}
 {{RT}}

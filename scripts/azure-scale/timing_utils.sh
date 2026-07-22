@@ -15,6 +15,14 @@ _TIMER_RUN_START=""
 _TIMER_JSON_OUTPUT="timing_report.json"
 _TIMER_DEPLOYMENT_TYPE="juju"
 
+# Normalize a numeric string produced by `bc` (which can emit values like
+# ".53" or "-.5") into valid JSON (e.g. "0.53", "-0.5"). Prints "0" for empty.
+_json_num() {
+    local v="$1"
+    [ -z "$v" ] && { echo "0"; return; }
+    printf '%.6f' "$v" 2>/dev/null || echo "0"
+}
+
 # Initialize the timing system
 # Usage: timer_init "deployment_type" ["output_file"]
 timer_init() {
@@ -77,9 +85,12 @@ emit_timing_report() {
     # Build phases JSON
     local phases_json="{}"
     for phase in "${!_TIMER_DURATION[@]}"; do
-        local duration="${_TIMER_DURATION[$phase]}"
-        local start="${_TIMER_START[$phase]}"
-        local end="${_TIMER_END[$phase]}"
+        local duration
+        duration=$(_json_num "${_TIMER_DURATION[$phase]}")
+        local start
+        start=$(_json_num "${_TIMER_START[$phase]}")
+        local end
+        end=$(_json_num "${_TIMER_END[$phase]}")
         phases_json=$(echo "$phases_json" | jq --arg p "$phase" \
             --argjson dur "$duration" \
             --argjson start "$start" \
@@ -90,19 +101,29 @@ emit_timing_report() {
     # Build application readiness JSON
     local app_json="{}"
     for app in "${!_APP_ACTIVE_TIME[@]}"; do
-        local active_at="${_APP_ACTIVE_TIME[$app]}"
+        local active_at
+        active_at=$(_json_num "${_APP_ACTIVE_TIME[$app]}")
         app_json=$(echo "$app_json" | jq --arg a "$app" \
             --argjson secs "$active_at" \
             '.[$a] = {seconds_from_wait_start: $secs}')
     done
 
-    # Compute spinup time (bootstrap through node_configured phases)
+    # Compute spinup time (phases from bootstrap through install_deps).
+    # The baseline pipeline uses different phase names (wait_ssh, setup_slurm)
+    # instead of bootstrap, wait_active, node_configured.
+    local spinup_phases
+    if [ "$_TIMER_DEPLOYMENT_TYPE" = "baseline" ]; then
+        spinup_phases="tofu_apply wait_ssh setup_slurm install_deps"
+    else
+        spinup_phases="bootstrap tofu_apply wait_active node_configured install_deps"
+    fi
     local spinup_seconds=0
-    for phase in bootstrap tofu_apply wait_active node_configured_gpu node_configured_cpu install_deps; do
+    for phase in $spinup_phases; do
         if [ -n "${_TIMER_DURATION[$phase]}" ]; then
             spinup_seconds=$(echo "$spinup_seconds + ${_TIMER_DURATION[$phase]}" | bc -l)
         fi
     done
+    spinup_seconds=$(_json_num "$spinup_seconds")
 
     # Compute teardown time
     local teardown_seconds=0
@@ -111,9 +132,10 @@ emit_timing_report() {
             teardown_seconds=$(echo "$teardown_seconds + ${_TIMER_DURATION[$phase]}" | bc -l)
         fi
     done
+    teardown_seconds=$(_json_num "$teardown_seconds")
 
     # Assemble final JSON
-    local extra="${3:-}"
+    total_duration=$(_json_num "$total_duration")
     jq -n \
         --arg run_id "$_TIMER_RUN_ID" \
         --arg dep_type "$_TIMER_DEPLOYMENT_TYPE" \
@@ -145,7 +167,7 @@ print_timing_summary() {
     echo "Deployment type: $_TIMER_DEPLOYMENT_TYPE"
     echo ""
     echo "--- Phases ---"
-    for phase in bootstrap tofu_apply wait_active node_configured_gpu node_configured_cpu \
+    for phase in bootstrap tofu_apply wait_active node_configured \
                   install_deps reframe_suite copy_results teardown_tofu teardown_juju; do
         if [ -n "${_TIMER_DURATION[$phase]}" ]; then
             printf "  %-25s %10.2f s\n" "$phase" "${_TIMER_DURATION[$phase]}"
